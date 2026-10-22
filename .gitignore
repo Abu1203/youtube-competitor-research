@@ -1,0 +1,39 @@
+# Runtime state and research data
+*.sqlite*
+*.db
+*.db-*
+*.xlsx
+*.xls
+*.csv
+*.tsv
+*.json
+导出文件/
+exports/
+data/
+logs/
+*.log
+
+# Local secrets and authentication
+.env
+.env.*
+!.env.example
+*cookie*
+*credential*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Dependencies and local tooling
+lib/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+dist/
+build/
