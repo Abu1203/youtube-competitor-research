@@ -876,7 +876,7 @@ class App:
         counts = store.counts(self.current_run)
         names = {"pending": "待处理", "accepted": "已入库", "error": "失败待重试",
                  "missing_date": "缺少日期待重试", "official": "排除官方频道",
-                 "year": "不在所选年份", "unrelated": "频道内容未提及品牌", "deleted": "已手动删除"}
+                 "year": "不在所选年份", "unrelated": "标题和描述未提及品牌", "deleted": "已手动删除"}
         lines = [LABELS[state], f"不同视频线索：{counts['unique']}", "按品牌分别计数（同一视频可能属于多个品牌）："]
         with self.ledger.connect() as db:
             for brand, outcome, count in db.execute("SELECT brand,state,count(*) FROM discovery_items WHERE run_id=? GROUP BY brand,state", (self.current_run,)):

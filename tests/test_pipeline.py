@@ -122,6 +122,17 @@ class PipelineTests(unittest.TestCase):
         self.collect()
         self.assertEqual(len(self.ledger.rows()), 4)
 
+    def test_search_accepts_brand_in_description_without_brand_in_title(self):
+        self.collector.rows['Alpha1'] = dict(row('Alpha1'), title='An unrelated title', description='Testing Alpha today')
+        self.collect()
+        self.assertIn('Alpha1', {r['video_id'] for r in self.ledger.rows()})
+
+    def test_search_rejects_without_brand_in_title_or_description(self):
+        self.collector.rows['Alpha1'] = dict(row('Alpha1'), title='An unrelated title', description='No match')
+        self.collect()
+        self.assertNotIn('Alpha1', {r['video_id'] for r in self.ledger.rows()})
+        self.assertEqual(TaskStore(self.ledger).counts(self.run)['items']['unrelated'], 1)
+
     def test_interruption_preserves_discovered_ids(self):
         def search(query, limit):
             yield 'saved1'

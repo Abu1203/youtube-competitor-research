@@ -189,7 +189,7 @@ def collect_web(ledger, collector, brands, years, depth, limit, run, publish, lo
                     outcome = 'missing_date'
                 elif row['published_at'][:4] not in {str(y) for y in years}:
                     outcome = 'year'
-                elif channel_scan and not any(w.casefold() in (row.get('title','') + ' ' + row.get('description','')).casefold() for w in brand['words']):
+                elif not any(w.casefold() in ((row.get('title') or '') + ' ' + (row.get('description') or '')).casefold() for w in brand['words']):
                     outcome = 'unrelated'
                 else:
                     publish(dict(row, brand=name), run)
