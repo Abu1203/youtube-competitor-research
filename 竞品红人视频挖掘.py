@@ -30,7 +30,8 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 if (APP_DIR / "lib").is_dir():
     sys.path.insert(0, str(APP_DIR / "lib"))
-from youtube_ledger import Ledger, channel_details, page_metrics, export_reference, table_values, local_stamp, HEADERS
+from youtube_ledger import Ledger, channel_details, page_metrics, export_reference, table_values, local_stamp, HEADERS, country_code
+from ytscrape_metrics import interaction_metrics
 from collection_pipeline import TaskStore, collect_web, LABELS, blocked
 STATE_PATH = APP_DIR / "竞品红人挖掘_工作数据.json"
 API_BASE = "https://www.googleapis.com/youtube/v3/"
@@ -438,7 +439,20 @@ class WebCollector:
             if info is None:
                 self.check_stop()
                 try:
-                    info = channel_details(channel_id)
+                    try:
+                        from ytscrape import YouTube
+                        if not hasattr(self, 'metadata_client'):
+                            self.metadata_client = YouTube()
+                        channel = self.metadata_client.channel(channel_id)
+                        subscribers = channel.subscribers
+                        label = channel.subscribers_text or ''
+                        if re.search(r'\d(?:\.\d+)?\s*[KMB]\b', label, re.I):
+                            subscribers = '约 ' + label
+                        info = {'region': country_code(channel.country) if channel.country else '未公开或未取得',
+                                'subscribers': subscribers,
+                                'channel_description': channel.description or ''}
+                    except ImportError:
+                        info = channel_details(channel_id)
                     if self.ledger:
                         self.ledger.store_channel(channel_id, info)
                 except Exception as exc:
@@ -459,7 +473,13 @@ class WebCollector:
             if not row.get("_page_fallback_done") or self.refresh:
                 self.check_stop()
                 try:
-                    values = page_metrics(row["video_id"])
+                    try:
+                        from ytscrape import InnerTubeClient
+                        if not hasattr(self, 'interaction_client'):
+                            self.interaction_client = InnerTubeClient()
+                        values = interaction_metrics(self.interaction_client.next(row['video_id']))
+                    except ImportError:
+                        values = page_metrics(row["video_id"])
                     for field, value in values.items():
                         if row.get(field) in (None, "") and value not in (None, ""):
                             row[field] = value

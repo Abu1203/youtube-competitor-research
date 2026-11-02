@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from collection_pipeline import TaskStore, collect_web
 from youtube_ledger import Ledger
+from ytscrape_metrics import interaction_metrics
 from test_core import app
 
 
@@ -235,6 +236,13 @@ class ApiPipelineTests(unittest.TestCase):
 
 
 class SearchRoutingTests(unittest.TestCase):
+    def test_interaction_data_handles_exact_likes_and_approximate_subscribers(self):
+        response = {'videoPrimaryInfoRenderer': {'segmentedLikeDislikeButtonViewModel': {
+            'button': {'iconName': 'LIKE', 'title': '1.2K', 'accessibilityText': 'like along with 1,234 other people'}}},
+            'videoOwnerRenderer': {'subscriberCountText': {'simpleText': '12.3K subscribers'}},
+            'engagementPanelTitleHeaderRenderer': {'title': {'simpleText': 'Comments'}, 'contextualInfo': {'simpleText': '45'}}}
+        self.assertEqual(interaction_metrics(response), {'likes': 1234, 'comments': 45, 'subscribers': '约 12.3K subscribers'})
+
     def test_metadata_backend_provides_date_and_full_description_without_watch_page(self):
         collector = app.WebCollector(threading.Event(), lambda _: None)
         collector.metadata_client = SimpleNamespace(video=lambda _: SimpleNamespace(
