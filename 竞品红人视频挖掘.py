@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+from collections import deque
+from itertools import zip_longest
 import queue
 import random
 import re
@@ -29,9 +31,10 @@ if str(APP_DIR) not in sys.path:
 if (APP_DIR / "lib").is_dir():
     sys.path.insert(0, str(APP_DIR / "lib"))
 from youtube_ledger import Ledger, channel_details, page_metrics, export_reference, table_values, local_stamp, HEADERS
+from collection_pipeline import TaskStore, collect_web, LABELS, blocked
 STATE_PATH = APP_DIR / "竞品红人挖掘_工作数据.json"
 API_BASE = "https://www.googleapis.com/youtube/v3/"
-YEARS = (2024, 2025, 2026)
+YEARS = tuple(range(2024, max(2026, datetime.now(timezone.utc).year) + 1))
 EXCEL_HEADERS = [
     "视频内容", "视频链接", "发布时间", "观看量", "点赞量", "评论量",
     "频道名称", "网红频道链接", "粉丝数", "地区", "类型",
@@ -332,13 +335,28 @@ class WebCollector:
 
     def search(self, query: str, limit: int):
         # 用网页的正常搜索分页；年份关键词只是扩充线索，详情日期才是筛选依据。
-        options = dict(self.options, extract_flat=True, lazy_playlist=True)
-        with self.yt_dlp.YoutubeDL(options) as ydl:
-            data = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-            for item in (data or {}).get("entries", []):
-                self.check_stop()
-                if item and item.get("id"):
-                    yield item["id"]
+        options = dict(self.options, extract_flat=True, lazy_playlist=True, playlistend=limit)
+        seen = set()
+        failures = []
+        # Search URL sorting, as supported by yt-dlp and used by scrapetube.
+        newest = "https://www.youtube.com/results?" + urllib.parse.urlencode({"search_query": query, "sp": "CAISAhAB"})
+        for label, url in (("相关度", f"ytsearch{limit}:{query}"), ("最新发布", newest)):
+            self.check_stop()
+            try:
+                with self.yt_dlp.YoutubeDL(options) as ydl:
+                    data = ydl.extract_info(url, download=False)
+                    for item in (data or {}).get("entries", []):
+                        self.check_stop()
+                        if item and item.get("id") and item["id"] not in seen:
+                            seen.add(item["id"])
+                            yield item["id"]
+            except Exception as exc:
+                if isinstance(exc, InterruptedError) or blocked(exc):
+                    raise
+                failures.append(str(exc))
+                self.log(f"{query} · {label} 搜索失败，尝试其他排序。")
+        if failures:
+            raise RuntimeError("部分排序未完成：" + "; ".join(failures))
 
     def video(self, brand: dict, video_id: str) -> dict | None:
         data = self.extract("https://www.youtube.com/watch?v=" + video_id)
@@ -363,7 +381,18 @@ class WebCollector:
             "evidence": evidence_for(title, description, brand["words"], None),
             "collected_at": utc_now(), "source": "网页 / yt-dlp",
         }
-        return self.enrich_row(row)
+        # Date determines eligibility; optional channel/engagement enrichment is deferred.
+        if not date_text:
+            self.check_stop()
+            try:
+                for field, value in page_metrics(video_id).items():
+                    if row.get(field) in (None, ""):
+                        row[field] = value
+            except Exception as exc:
+                if isinstance(exc, InterruptedError) or blocked(exc):
+                    raise
+                self.log(f"日期暂未取得，线索将保留供重试：{video_id}")
+        return row
 
     def enrich_row(self, row):
         row = dict(row)
@@ -379,6 +408,8 @@ class WebCollector:
                     if self.ledger:
                         self.ledger.store_channel(channel_id, info)
                 except Exception as exc:
+                    if isinstance(exc, InterruptedError) or blocked(exc):
+                        raise
                     self.log(f"频道地区暂未取得：{channel_id} · {str(exc)[:160]}")
                     info = {"region": "获取失败"}
             self.channel_cache[channel_id] = info
@@ -400,6 +431,8 @@ class WebCollector:
                             row[field] = value
                     row["_page_fallback_done"] = True
                 except Exception as exc:
+                    if isinstance(exc, InterruptedError) or blocked(exc):
+                        raise
                     self.log(f"视频补充字段暂未取得：{row['video_id']} · {str(exc)[:160]}")
         if not row.get("video_type") or row.get("video_type") == "待分类":
             row["video_type"] = infer_type(row.get("title", ""))
@@ -455,7 +488,7 @@ class App:
         self.brand_rows = []
         self.collect_mode = StringVar(value="网页采集（免 Key）")
         self.api_key = StringVar()
-        self.search_limit = StringVar(value="100")
+        self.search_limit = StringVar(value="300")
         self.batch_limit = StringVar(value="500")
         self.refresh_existing = BooleanVar(value=False)
         self.year_vars = {year: BooleanVar(value=True) for year in YEARS}
@@ -507,10 +540,10 @@ class App:
         mode = ttk.Combobox(controls, values=("网页采集（免 Key）", "官方 API"), textvariable=self.collect_mode, state="readonly", width=20)
         mode.pack(side=LEFT)
         mode.bind("<<ComboboxSelected>>", self.mode_changed)
-        self.depth_label = ttk.Label(controls, text="每词搜索条数")
+        self.depth_label = ttk.Label(controls, text="每词/排序线索上限")
         self.depth_label.pack(side=LEFT, padx=(12, 5))
-        ttk.Spinbox(controls, from_=1, to=1000, textvariable=self.search_limit, width=6).pack(side=LEFT)
-        self.limit_label = ttk.Label(controls, text="当次详情采集上限")
+        ttk.Spinbox(controls, from_=1, to=10000, textvariable=self.search_limit, width=6).pack(side=LEFT)
+        self.limit_label = ttk.Label(controls, text="本次详情请求上限")
         self.limit_label.pack(side=LEFT, padx=(12, 5))
         ttk.Spinbox(controls, from_=1, to=10000, textvariable=self.batch_limit, width=6).pack(side=LEFT)
         for year in YEARS:
@@ -522,13 +555,14 @@ class App:
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill=X, pady=(4, 9))
-        self.start_button = ttk.Button(buttons, text="开始采集", command=self.start_search)
+        self.start_button = ttk.Button(buttons, text="开始 / 继续采集", command=self.start_search)
         self.start_button.pack(side=LEFT)
         self.channel_button = ttk.Button(buttons, text="补扫历史红人频道", command=lambda: self.start_search(True))
         self.channel_button.pack(side=LEFT, padx=8)
         self.stop_button = ttk.Button(buttons, text="停止", command=self.stop_search, state="disabled")
         self.stop_button.pack(side=LEFT)
         ttk.Button(buttons, text="一键导出当次 Excel", command=self.export_current).pack(side=LEFT, padx=14)
+        ttk.Button(buttons, text="查看采集进度", command=self.show_progress).pack(side=LEFT)
         self.current_count = StringVar()
         ttk.Label(buttons, textvariable=self.current_count).pack(side=RIGHT)
 
@@ -548,7 +582,7 @@ class App:
         filters.pack(fill=X, pady=(0, 5))
         self.brand_filter = ttk.Combobox(filters, textvariable=self.history_brand, state="readonly", width=18)
         self.brand_filter.pack(side=LEFT)
-        self.year_filter = ttk.Combobox(filters, textvariable=self.history_year, values=("全部年份", "2024", "2025", "2026"), state="readonly", width=12)
+        self.year_filter = ttk.Combobox(filters, textvariable=self.history_year, values=("全部年份",) + tuple(map(str, YEARS)), state="readonly", width=12)
         self.year_filter.pack(side=LEFT, padx=6)
         self.batch_filter = ttk.Combobox(filters, textvariable=self.history_batch, state="readonly", width=32)
         self.batch_filter.pack(side=LEFT)
@@ -649,9 +683,9 @@ class App:
 
     def mode_changed(self, _event=None):
         web = self.collect_mode.get().startswith("网页")
-        self.depth_label.configure(text="每词搜索条数" if web else "搜索页数/季度")
-        self.limit_label.configure(text="当次详情采集上限" if web else "当次搜索调用上限")
-        self.search_limit.set("100" if web else "2")
+        self.depth_label.configure(text="每词/排序线索上限" if web else "搜索页数/季度")
+        self.limit_label.configure(text="本次详情请求上限" if web else "当次搜索调用上限")
+        self.search_limit.set("300" if web else "2")
         self.batch_limit.set("500" if web else "80")
         if web:
             self.key_frame.pack_forget()
@@ -761,12 +795,45 @@ class App:
 
     def begin_run(self, config, label):
         self.stop.clear()
-        self.current_run = self.ledger.create_run(config, label)
+        tasks = TaskStore(self.ledger)
+        previous = tasks.resume(config, label) if config else None
+        self.current_run = previous or self.ledger.create_run(config, label)
+        if previous:
+            self.ledger.set_setting("last_run", previous)
+            with self.ledger.connect() as db:
+                db.execute("UPDATE runs SET finished_at=NULL WHERE run_id=?", (previous,))
+            self.log("继续未完成批次：已保存线索、已完成查询和已处理视频会被复用。")
+        tasks.status(self.current_run, "running")
         for button in (self.start_button, self.channel_button, self.fill_button):
             button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.tabs.select(0)
         self.refresh_tables()
+
+    def show_progress(self):
+        if not self.current_run:
+            messagebox.showinfo("采集进度", "尚未开始采集。")
+            return
+        store = TaskStore(self.ledger)
+        state, summary = store.result(self.current_run)
+        counts = store.counts(self.current_run)
+        names = {"pending": "待处理", "accepted": "已入库", "error": "失败待重试",
+                 "missing_date": "缺少日期待重试", "official": "排除官方频道",
+                 "year": "不在所选年份", "unrelated": "频道内容未提及品牌", "deleted": "已手动删除"}
+        lines = [LABELS[state], f"不同视频线索：{counts['unique']}", "按品牌分别计数（同一视频可能属于多个品牌）："]
+        with self.ledger.connect() as db:
+            for brand, outcome, count in db.execute("SELECT brand,state,count(*) FROM discovery_items WHERE run_id=? GROUP BY brand,state", (self.current_run,)):
+                lines.append(f"{brand} · {names.get(outcome, outcome)}：{count}")
+            errors = db.execute("SELECT brand,query,error FROM discovery_jobs WHERE run_id=? AND state='error' LIMIT 3", (self.current_run,)).fetchall()
+        lines.append(f"已完成查询：{counts['jobs'].get('complete', 0)}；失败查询：{counts['jobs'].get('error', 0)}")
+        if summary.get("remaining_queries") is not None:
+            lines.append(f"API 待处理查询：{summary['remaining_queries']}")
+        if summary.get("unresolved_official"):
+            lines.append("官方频道待核对：" + "、".join(summary["unresolved_official"]))
+        for brand, query, error in errors:
+            lines.append(f"查询错误：{brand} · {query} · {error[:120]}")
+        lines.append("相同设置点击‘开始 / 继续采集’可续接；提高本次详情额度也可续接。")
+        messagebox.showinfo("采集进度", "\n".join(lines))
 
     def start_search(self, channel_scan=False):
         if self.worker and self.worker.is_alive():
@@ -776,7 +843,7 @@ class App:
             years = [year for year in YEARS if self.year_vars[year].get()]
             depth, limit = int(self.search_limit.get()), int(self.batch_limit.get())
             web = self.collect_mode.get().startswith("网页")
-            if not years or not 1 <= depth <= (1000 if web else 10) or not 1 <= limit <= (10000 if web else 100):
+            if not years or not 1 <= depth <= (10000 if web else 10) or not 1 <= limit <= (10000 if web else 100):
                 raise ValueError("请选择年份并填写有效的搜索深度与当次上限。")
             if web:
                 __import__("yt_dlp")
@@ -789,7 +856,9 @@ class App:
         except (ValueError, ImportError) as exc:
             messagebox.showerror("设置有误", str(exc))
             return
-        config = {"brands": brands, "years": years, "mode": self.collect_mode.get()}
+        config = {"brands": brands, "years": years, "mode": self.collect_mode.get(),
+                  "depth": depth, "limit": limit, "refresh": self.refresh_existing.get(),
+                  "channel_scan": channel_scan, "pipeline": 2}
         self.begin_run(config, "频道补扫" if channel_scan else "关键词采集")
         args = (brands, years, depth, limit, self.current_run, self.refresh_existing.get(), channel_scan)
         target = self.run_web if web else self.run_api
@@ -821,126 +890,114 @@ class App:
             self.events.put(("changed", None))
 
     def run_web(self, brands, years, depth, limit, run_id, refresh=False, channel_scan=False):
-        attempted = 0
-        seen_pairs, details = set(), {}
         try:
             collector = WebCollector(self.stop, self.log, self.ledger, refresh)
-            history = self.ledger.rows()
-            for brand in brands:
-                official_id = collector.resolve_official(brand["official"])
-                if channel_scan:
-                    queries = list(dict.fromkeys(row.get("channel_id") for row in history if row.get("channel_id") and brand["name"] in row.get("brands", [row.get("brand")])))
-                else:
-                    queries = list(dict.fromkeys(query for word in brand["words"] for query in [word] + [f"{word} {year}" for year in years]))
-                for query in queries:
-                    collector.check_stop()
-                    self.log(f"{'补扫频道' if channel_scan else '搜索'}：{query}")
-                    found = collector.channel_videos(query, depth) if channel_scan else collector.search(query, depth)
-                    for video_id in found:
-                        pair = (brand["name"], video_id)
-                        if pair in seen_pairs:
-                            continue
-                        seen_pairs.add(pair)
-                        saved = self.ledger.get_video(video_id)
-                        if saved and saved.get("_deleted"):
-                            continue
-                        row = details.get(video_id) or (saved if not refresh else None)
-                        fetched = False
-                        try:
-                            if not row:
-                                if attempted >= limit:
-                                    self.log(f"达到当次详情上限 {limit}；已保存进度，下次可继续。")
-                                    return
-                                attempted += 1
-                                fetched = True
-                                row = collector.video(brand, video_id)
-                            elif row.get("region") in (None, "", "获取失败") or not row.get("_page_fallback_done") and any(row.get(field) is None for field in ("views", "likes", "comments", "subscribers")):
-                                row = collector.enrich_row(row)
-                            if not row:
-                                continue
-                            row = dict(row, brand=brand["name"])
-                            details[video_id] = row
-                            self.ledger.store_cache(row)
-                        except Exception as exc:
-                            if self.stop.is_set():
-                                raise InterruptedError("采集已停止") from exc
-                            if any(word in str(exc).lower() for word in ("429", "not a bot", "too many requests", "验证访问")):
-                                raise RuntimeError("YouTube 网页限流或要求验证；已保存数据，请稍后继续。") from exc
-                            self.log(f"{video_id} 未取得详情：{str(exc)[:180]}")
-                            collector.pause()
-                            continue
-                        date = row.get("published_at", "")
-                        if row.get("channel_id") == official_id:
-                            continue
-                        if not date or date[:4] not in [str(year) for year in years]:
-                            if fetched:
-                                collector.pause()
-                            continue
-                        if channel_scan and not any(word.casefold() in (row.get("title", "") + " " + row.get("description", "")).casefold() for word in brand["words"]):
-                            if fetched:
-                                collector.pause()
-                            continue
-                        self.publish(row, run_id)
-                        self.log(f"{'新读取' if fetched else '复用台账'} · {brand['name']} · {row.get('channel_name','')} · {row.get('title','')[:65]}")
-                        if fetched:
-                            collector.pause()
+            collect_web(self.ledger, collector, brands, years, depth, limit, run_id,
+                        self.publish, self.log, refresh, channel_scan)
         except Exception as exc:
-            if not isinstance(exc, InterruptedError):
-                self.events.put(("error", str(exc)))
-        finally:
+            TaskStore(self.ledger).status(run_id, "failed")
             self.ledger.finish_run(run_id)
+            self.events.put(("error", str(exc)))
+        finally:
             self.events.put(("finished", run_id))
 
     def run_api(self, key, brands, years, depth, limit, run_id, refresh=False):
         api = YouTubeApi(key, self.stop)
+        tasks = TaskStore(self.ledger)
+        checkpoint_key = "api_checkpoint:" + run_id
+        plans = []
+        for brand in brands:
+            plans.append([{"brand": brand, "start": start.isoformat(), "end": end.isoformat(),
+                           "token": "", "page": 0}
+                          for year in years for start, end in quarter_windows(year)])
+        checkpoint = self.ledger.setting(checkpoint_key, None)
+        pending = deque(checkpoint if checkpoint is not None else
+                        [task for group in zip_longest(*plans) for task in group if task])
+        failed, officials = [], {}
+        state = "complete"
+        current = None
         try:
-            enricher = WebCollector(self.stop, self.log, self.ledger, refresh)
-            for brand in brands:
-                official = api.resolve_official(brand["official"])
-                for year in years:
-                    for start, end in quarter_windows(year):
-                        token = ""
-                        for _page in range(depth):
-                            if api.search_calls >= limit:
-                                return
-                            result = api.search(brand["query"], start, end, token)
-                            fresh = []
-                            for item in result.get("items", []):
-                                video_id = item.get("id", {}).get("videoId")
-                                if not video_id:
-                                    continue
-                                old = self.ledger.get_video(video_id)
-                                if old and old.get("_deleted"):
-                                    continue
-                                if old and not refresh:
-                                    if old.get("channel_id") != official and old.get("published_at", "")[:4] in [str(value) for value in years]:
-                                        self.publish(dict(enricher.enrich_row(old), brand=brand["name"]), run_id)
-                                else:
-                                    fresh.append(item)
-                            for row in candidates_from_page(brand, official, api, fresh):
-                                self.publish(enricher.enrich_row(row), run_id)
-                            token = result.get("nextPageToken", "")
-                            if not token:
-                                break
+            while pending:
+                if self.stop.is_set():
+                    raise InterruptedError("采集已停止")
+                if api.search_calls >= limit:
+                    state = "budget"
+                    break
+                current = pending.popleft()
+                brand = current["brand"]
+                try:
+                    if brand["name"] not in officials:
+                        officials[brand["name"]] = api.resolve_official(brand["official"])
+                    official = officials[brand["name"]]
+                    result = api.search(brand["query"], datetime.fromisoformat(current["start"]),
+                                        datetime.fromisoformat(current["end"]), current["token"])
+                    fresh = []
+                    for item in result.get("items", []):
+                        video_id = item.get("id", {}).get("videoId")
+                        if not video_id:
+                            continue
+                        old = self.ledger.get_video(video_id)
+                        if old and old.get("_deleted"):
+                            continue
+                        if old and not refresh and old.get("published_at"):
+                            if (not official or old.get("channel_id") != official) and old["published_at"][:4] in [str(y) for y in years]:
+                                self.publish(dict(old, brand=brand["name"]), run_id)
+                        else:
+                            fresh.append(item)
+                    for row in candidates_from_page(brand, official, api, fresh):
+                        if row.get("published_at", "")[:4] in [str(y) for y in years]:
+                            self.publish(row, run_id)
+                    current["page"] += 1
+                    current["token"] = result.get("nextPageToken", "")
+                    if current["token"] and current["page"] < depth:
+                        pending.append(current)
+                    self.log(f"API 已保存：{brand['name']} · {current['start'][:10]} · 第 {current['page']} 页")
+                except Exception as exc:
+                    if isinstance(exc, InterruptedError) or blocked(exc) or isinstance(exc, ApiError) and exc.code in (401, 403):
+                        pending.appendleft(current)
+                        current = None
+                        raise
+                    failed.append(current)
+                    self.log(f"API 查询失败，继续其他任务：{brand['name']} · {exc}")
+                current = None
+                self.ledger.set_setting(checkpoint_key, list(pending) + failed)
+            if state == "complete" and failed:
+                state = "partial"
+        except InterruptedError:
+            state = "stopped"
         except Exception as exc:
-            if not isinstance(exc, InterruptedError):
-                self.events.put(("error", str(exc)))
+            state = "blocked" if blocked(exc) or isinstance(exc, ApiError) and exc.code in (401, 403) else "failed"
+            self.events.put(("error", str(exc)))
         finally:
+            if current:
+                pending.appendleft(current)
+            self.ledger.set_setting(checkpoint_key, list(pending) + failed)
+            tasks.status(run_id, state, {"remaining_queries": len(pending) + len(failed), "search_calls": api.search_calls})
             self.ledger.finish_run(run_id)
             self.events.put(("finished", run_id))
 
     def run_fill(self, rows, run_id):
+        state = "complete"
         try:
             collector = WebCollector(self.stop, self.log, self.ledger)
             for row in rows:
                 collector.check_stop()
-                self.publish(collector.enrich_row(row), run_id)
-                self.log(f"字段补齐：{row.get('channel_name','')} · {row.get('title','')[:70]}")
+                try:
+                    self.publish(collector.enrich_row(row), run_id)
+                    self.log(f"字段补齐：{row.get('channel_name','')} · {row.get('title','')[:70]}")
+                except Exception as exc:
+                    if isinstance(exc, InterruptedError) or blocked(exc):
+                        raise
+                    state = "partial"
+                    self.log(f"字段补齐失败，继续下一条：{exc}")
                 collector.pause()
+        except InterruptedError:
+            state = "stopped"
         except Exception as exc:
-            if not isinstance(exc, InterruptedError):
-                self.events.put(("error", str(exc)))
+            state = "blocked" if blocked(exc) else "failed"
+            self.events.put(("error", str(exc)))
         finally:
+            TaskStore(self.ledger).status(run_id, state)
             self.ledger.finish_run(run_id)
             self.events.put(("finished", run_id))
 
@@ -964,7 +1021,9 @@ class App:
                         button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
                     count = len(self.ledger.rows(payload))
-                    self.status_text.set(f"{'已停止' if self.stop.is_set() else '当次结束'}：{count} 条已入台账，可一键导出。")
+                    state, summary = TaskStore(self.ledger).result(payload)
+                    detail = f"发现 {summary['unique']} 个视频，" if 'unique' in summary else ""
+                    self.status_text.set(f"{LABELS[state]}：{detail}{count} 条已入台账。缺失地区等可点击‘补齐字段’。")
                     dirty = True
         except queue.Empty:
             pass
