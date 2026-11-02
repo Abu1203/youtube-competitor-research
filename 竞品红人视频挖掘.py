@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import deque
 from itertools import zip_longest
 import queue
@@ -25,13 +26,14 @@ from tkinter import END, BOTH, LEFT, RIGHT, VERTICAL, X, Y, StringVar, Tk, Text,
 from tkinter import ttk
 
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 if (APP_DIR / "lib").is_dir():
     sys.path.insert(0, str(APP_DIR / "lib"))
 from youtube_ledger import Ledger, channel_details, page_metrics, export_grouped, table_values, local_stamp, HEADERS, country_code
 from ytscrape_metrics import interaction_metrics
+from one_click_export import export_bundle
 from collection_pipeline import TaskStore, collect_web, LABELS, blocked
 STATE_PATH = APP_DIR / "竞品红人挖掘_工作数据.json"
 API_BASE = "https://www.googleapis.com/youtube/v3/"
@@ -363,6 +365,50 @@ class WebCollector:
         if failures:
             raise RuntimeError("部分排序未完成：" + "; ".join(failures))
 
+    def search_deep(self, query: str, limit: int):
+        # scrapetube paginates each ordering; encode query because it builds a URL.
+        import scrapetube
+        seen, failures = set(), []
+        module = scrapetube.scrapetube
+        original = module.get_session
+        def timed_session(proxies=None):
+            session = original(proxies)
+            request = session.request
+            def bounded(method, url, **kwargs):
+                kwargs.setdefault('timeout', 25)
+                response = request(method, url, **kwargs)
+                response.raise_for_status()
+                return response
+            session.request = bounded
+            return session
+        module.get_session = timed_session
+        try:
+            for order in ('relevance', 'upload_date'):
+                for attempt in range(2):
+                    try:
+                        entries = scrapetube.get_search(urllib.parse.quote(query, safe=''), limit=limit, sort_by=order, sleep=1)
+                        for item in entries:
+                            self.check_stop()
+                            vid = item.get('videoId')
+                            if vid and vid not in seen:
+                                seen.add(vid)
+                                yield vid
+                        break
+                    except Exception as exc:
+                        if isinstance(exc, InterruptedError) or blocked(exc):
+                            raise
+                        if attempt == 0:
+                            self.log(f'{query} · {order} 暂时失败，自动重试。')
+                            if self.stop.wait(1):
+                                raise InterruptedError('采集已停止')
+                        else:
+                            failures.append(str(exc))
+                            self.log(f'{query} · {order} 搜索失败，稍后可续接。')
+        finally:
+            module.get_session = original
+        if failures:
+            raise RuntimeError('部分排序未完成：' + '; '.join(failures))
+
     def video(self, brand: dict, video_id: str) -> dict | None:
         # ytscrape retrieves public metadata without downloading media. Its
         # InnerTube client can succeed when the yt-dlp watch-page path is blocked.
@@ -492,7 +538,7 @@ class WebCollector:
             row["video_type"] = infer_type(row.get("title", ""))
         return row
 
-    def channel_videos(self, channel_id: str, limit: int):
+    def channel_videos(self, channel_id: str, limit: int, brand=None):
         options = dict(self.options, extract_flat=True, lazy_playlist=True, playlistend=limit)
         for tab in ("videos", "shorts", "streams"):
             self.check_stop()
@@ -501,7 +547,8 @@ class WebCollector:
                     data = ydl.extract_info(f"https://www.youtube.com/channel/{channel_id}/{tab}", download=False)
                     for item in (data or {}).get("entries", []):
                         self.check_stop()
-                        if item and item.get("id"):
+                        if (item and item.get("id") and (not brand or not item.get('title')
+                                or brand['name'].casefold() in item['title'].casefold())):
                             yield item["id"]
             except Exception as exc:
                 text = str(exc).lower()
@@ -510,8 +557,28 @@ class WebCollector:
                 else:
                     raise
 
+    def channel_videos_deep(self, channel_id: str, limit: int, brand=None):
+        # The extra ytscrape Videos-tab pass supplements the existing three tabs.
+        from ytscrape import YouTube
+        seen = set()
+        try:
+            for item in YouTube().channel_videos(channel_id, max_results=limit):
+                self.check_stop()
+                if (item.video_id and item.video_id not in seen and (not brand or not item.title
+                        or brand['name'].casefold() in item.title.casefold())):
+                    seen.add(item.video_id)
+                    yield item.video_id
+        except Exception as exc:
+            if isinstance(exc, InterruptedError) or blocked(exc):
+                raise
+            self.log(f'频道补充分页失败，继续常规分页：{str(exc)[:120]}')
+        for vid in self.channel_videos(channel_id, limit, brand):
+            if vid not in seen:
+                seen.add(vid)
+                yield vid
+
     def pause(self):
-        if self.stop.wait(random.uniform(1.5, 3)):
+        if self.stop.wait(random.uniform(.5, .8)):
             raise InterruptedError("采集已停止")
 
 
@@ -541,11 +608,13 @@ class App:
         self.current_run = self.ledger.setting("last_run")
         self.brand_rows = []
         saved_ui = self.ledger.setting("collection_config", {})
-        self.collect_mode = StringVar(value=saved_ui.get("mode", "网页采集（免 Key）"))
+        self.collect_mode = StringVar(value="网页采集（免 Key）")
         self.api_key = StringVar()
-        self.search_limit = StringVar(value=str(saved_ui.get("depth", 300)))
-        self.batch_limit = StringVar(value=str(saved_ui.get("limit", 500)))
-        self.refresh_existing = BooleanVar(value=saved_ui.get("refresh", False))
+        self.search_limit = StringVar(value="250")
+        self.batch_limit = StringVar(value="500")
+        self.refresh_existing = BooleanVar(value=False)
+        self.deep_discovery = BooleanVar(value=True)
+        self.strict_title = BooleanVar(value=True)
         self.year_vars = {year: BooleanVar(value=year in saved_ui.get("years", YEARS)) for year in YEARS}
         self.history_brand = StringVar(value="全部品牌")
         self.history_year = StringVar(value="全部年份")
@@ -587,37 +656,40 @@ class App:
         window = self.brand_canvas.create_window((0, 0), window=self.brand_container, anchor="nw")
         self.brand_container.bind("<Configure>", lambda _e: self.brand_canvas.configure(scrollregion=self.brand_canvas.bbox("all")))
         self.brand_canvas.bind("<Configure>", lambda e: self.brand_canvas.itemconfigure(window, width=e.width))
-        saved = self.ledger.setting("brands", [{"name": "", "official": "", "terms": ""}])
+        saved = self.ledger.setting("brands")
+        if not saved:
+            try:
+                initial = json.loads((APP_DIR / '初始配置.json').read_text(encoding='utf-8-sig'))
+                saved = initial.get('brands') if isinstance(initial, dict) else None
+            except (OSError, ValueError):
+                saved = None
+        saved = saved if isinstance(saved, list) and saved else [{"name": "", "official": "", "terms": ""}]
         for brand in saved:
             self.add_brand(brand)
 
         controls = ttk.Frame(outer)
         controls.pack(fill=X, pady=(9, 5))
         mode = ttk.Combobox(controls, values=("网页采集（免 Key）", "官方 API"), textvariable=self.collect_mode, state="readonly", width=20)
-        mode.pack(side=LEFT)
         mode.bind("<<ComboboxSelected>>", self.mode_changed)
         self.depth_label = ttk.Label(controls, text="每词/排序线索上限")
-        self.depth_label.pack(side=LEFT, padx=(12, 5))
-        ttk.Spinbox(controls, from_=1, to=10000, textvariable=self.search_limit, width=6).pack(side=LEFT)
         self.limit_label = ttk.Label(controls, text="本次详情请求上限")
-        self.limit_label.pack(side=LEFT, padx=(12, 5))
-        ttk.Spinbox(controls, from_=1, to=10000, textvariable=self.batch_limit, width=6).pack(side=LEFT)
+        ttk.Label(controls, text="采集年份：").pack(side=LEFT)
         for year in YEARS:
             ttk.Checkbutton(controls, text=str(year), variable=self.year_vars[year]).pack(side=LEFT, padx=7)
-        ttk.Checkbutton(controls, text="刷新历史指标", variable=self.refresh_existing).pack(side=LEFT, padx=10)
+        ttk.Label(controls, text="自动搜索、补扫、核验并导出", foreground="#53616E").pack(side=LEFT, padx=12)
         self.key_frame = ttk.Frame(outer)
         ttk.Label(self.key_frame, text="YouTube API Key").pack(side=LEFT)
         ttk.Entry(self.key_frame, textvariable=self.api_key, show="•", width=50).pack(side=LEFT, padx=8)
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill=X, pady=(4, 9))
-        self.start_button = ttk.Button(buttons, text="开始 / 继续采集", command=self.start_search)
+        self.start_button = ttk.Button(buttons, text="开始采集并自动导出", command=self.start_search)
         self.start_button.pack(side=LEFT)
         self.channel_button = ttk.Button(buttons, text="补扫历史红人频道", command=lambda: self.start_search(True))
-        self.channel_button.pack(side=LEFT, padx=8)
         self.stop_button = ttk.Button(buttons, text="停止", command=self.stop_search, state="disabled")
         self.stop_button.pack(side=LEFT)
         ttk.Button(buttons, text="一键导出当次 Excel", command=self.export_current).pack(side=LEFT, padx=14)
+        ttk.Button(buttons, text="打开自动导出结果", command=self.open_results).pack(side=LEFT, padx=(0, 8))
         ttk.Button(buttons, text="查看采集进度", command=self.show_progress).pack(side=LEFT)
         self.current_count = StringVar()
         ttk.Label(buttons, textvariable=self.current_count).pack(side=RIGHT)
@@ -651,7 +723,6 @@ class App:
         hist_buttons.pack(fill=X, pady=(0, 6))
         ttk.Button(hist_buttons, text="导出当前历史视图", command=self.export_history).pack(side=LEFT)
         self.fill_button = ttk.Button(hist_buttons, text="补齐历史缺失字段", command=self.start_fill)
-        self.fill_button.pack(side=LEFT, padx=8)
         ttk.Button(hist_buttons, text="删除选中", command=self.delete_selected).pack(side=LEFT)
         ttk.Button(hist_buttons, text="恢复选中", command=self.restore_selected).pack(side=LEFT, padx=8)
         self.history_count = StringVar()
@@ -842,13 +913,27 @@ class App:
             messagebox.showerror("导出失败", str(exc))
             return
         self.status_text.set(f"已导出 {len(rows)} 条：{path}")
-        messagebox.showinfo("导出完成", f"共 {len(rows)} 条，11 列与参考 Excel 一致。\n{path}")
+        messagebox.showinfo("导出完成", f"共 {len(rows)} 条视频，导出按品牌分组。\n{path}")
 
     def export_current(self):
         self.do_export(self.ledger.rows(self.current_run) if self.current_run else [], "当次采集")
 
     def export_history(self):
         self.do_export(self.history_rows, "历史台账")
+
+    def open_results(self):
+        if not self.current_run:
+            messagebox.showinfo('采集结果', '尚未开始采集。')
+            return
+        _, summary = TaskStore(self.ledger).result(self.current_run)
+        directory = summary.get('export_directory')
+        if not directory or not Path(directory).is_dir():
+            messagebox.showinfo('采集结果', '结果尚未自动导出，请等待本次采集结束。')
+            return
+        if hasattr(os, 'startfile'):
+            os.startfile(directory)
+        else:
+            webbrowser.open(Path(directory).resolve().as_uri())
 
     def begin_run(self, config, label):
         self.stop.clear()
@@ -904,6 +989,8 @@ class App:
                 raise ValueError("请选择年份并填写有效的搜索深度与当次上限。")
             if web:
                 __import__("yt_dlp")
+                if self.deep_discovery.get():
+                    __import__("scrapetube")
             elif not self.api_key.get().strip():
                 raise ValueError("官方 API 模式需要 API Key；网页模式无需 Key。")
             if channel_scan and not web:
@@ -915,13 +1002,15 @@ class App:
             return
         config = {"brands": brands, "years": years, "mode": self.collect_mode.get(),
                   "depth": depth, "limit": limit, "refresh": self.refresh_existing.get(),
-                  "channel_scan": channel_scan, "pipeline": 2}
+                  "channel_scan": channel_scan, "deep": self.deep_discovery.get(),
+                  "strict_title": self.strict_title.get(), "pipeline": 3}
         self.ledger.set_setting("collection_config", config)
         self.begin_run(config, "频道补扫" if channel_scan else "关键词采集")
-        args = (brands, years, depth, limit, self.current_run, self.refresh_existing.get(), channel_scan)
+        args = (brands, years, depth, limit, self.current_run, self.refresh_existing.get(), channel_scan,
+                self.deep_discovery.get(), self.strict_title.get())
         target = self.run_web if web else self.run_api
         if not web:
-            args = (self.api_key.get().strip(),) + args[:-1]
+            args = (self.api_key.get().strip(),) + args[:6]
         self.worker = threading.Thread(target=target, args=args, daemon=True)
         self.worker.start()
 
@@ -947,16 +1036,63 @@ class App:
         if self.ledger.add_video(row, run_id):
             self.events.put(("changed", None))
 
-    def run_web(self, brands, years, depth, limit, run_id, refresh=False, channel_scan=False):
+    def run_web(self, brands, years, depth, limit, run_id, refresh=False, channel_scan=False, deep=False, strict_title=False):
+        state, summary = 'failed', {}
+        collector = None
         try:
             collector = WebCollector(self.stop, self.log, self.ledger, refresh)
-            collect_web(self.ledger, collector, brands, years, depth, limit, run_id,
-                        self.publish, self.log, refresh, channel_scan)
+            retry_issues = True
+            def exhaust(scan):
+                nonlocal retry_issues
+                while True:
+                    current, detail = collect_web(self.ledger, collector, brands, years, depth, limit, run_id,
+                                                   self.publish, self.log, refresh, scan, deep, strict_title, retry_issues)
+                    retry_issues = False
+                    if current != 'budget':
+                        return current, detail
+                    self.log('继续处理剩余视频，进度已保存。')
+
+            self.log('第一步：按品牌和年份分段搜索并核验视频。')
+            state, summary = exhaust(channel_scan)
+            if state in ('complete', 'partial') and not channel_scan:
+                first_state = state
+                self.log('第二步：自动补扫已发现的红人频道。')
+                state, summary = exhaust(True)
+                if state == 'complete' and first_state == 'partial':
+                    state = 'partial'
+            if state in ('complete', 'partial'):
+                TaskStore(self.ledger).status(run_id, 'running', summary)
+                self.log('第三步：自动补齐可公开获取的互动数据和频道信息。')
+                existing = self.ledger.rows(run_id)
+                for index, row in enumerate(existing, 1):
+                    collector.check_stop()
+                    try:
+                        self.publish(collector.enrich_row(row), run_id)
+                    except Exception as exc:
+                        if isinstance(exc, InterruptedError) or blocked(exc):
+                            raise
+                        state = 'partial'
+                        self.log(f"字段补齐失败，保留记录：{row.get('video_id', '')} · {str(exc)[:120]}")
+                    if index % 10 == 0 or index == len(existing):
+                        self.log(f'字段补齐进度：{index}/{len(existing)} 条。')
+                    collector.pause()
+        except InterruptedError:
+            state = 'stopped'
         except Exception as exc:
-            TaskStore(self.ledger).status(run_id, "failed")
-            self.ledger.finish_run(run_id)
+            state = 'blocked' if blocked(exc) else 'failed'
             self.events.put(("error", str(exc)))
         finally:
+            try:
+                directory = APP_DIR / '导出文件' / ('采集结果_' + run_id)
+                paths = export_bundle(self.ledger.rows(run_id), directory, TEMPLATE_PATH, brands, years)
+                summary['export_directory'] = str(directory)
+                summary['export_count'] = len(paths)
+                self.log(f"已自动导出 {len(paths)} 个文件：{directory}")
+            except Exception as exc:
+                state = 'failed'
+                self.events.put(('error', f'自动导出失败：{exc}'))
+            TaskStore(self.ledger).status(run_id, state, summary)
+            self.ledger.finish_run(run_id)
             self.events.put(("finished", run_id))
 
     def run_api(self, key, brands, years, depth, limit, run_id, refresh=False):
@@ -1081,7 +1217,10 @@ class App:
                     count = len(self.ledger.rows(payload))
                     state, summary = TaskStore(self.ledger).result(payload)
                     detail = f"发现 {summary['unique']} 个视频，" if 'unique' in summary else ""
-                    self.status_text.set(f"{LABELS[state]}：{detail}{count} 条已入台账。缺失地区等可点击‘补齐字段’。")
+                    destination = summary.get('export_directory', '')
+                    self.status_text.set(f"{LABELS[state]}：{detail}{count} 条已入台账。结果：{destination}")
+                    if destination and Path(destination).is_dir():
+                        self.open_results()
                     dirty = True
         except queue.Empty:
             pass
@@ -1106,5 +1245,47 @@ def main():
     root.mainloop()
 
 
+def check_package(report_path, term):
+    """Read-only network and temporary-export smoke test for a portable build."""
+    import tempfile
+    from openpyxl import load_workbook
+    result = {'ok': False}
+    try:
+        root = Tk()
+        root.withdraw()
+        root.update_idletasks()
+        root.destroy()
+        collector = WebCollector(threading.Event(), lambda _: None)
+        found = list(collector.search_deep(term, 3))
+        row = None
+        for vid in found:
+            candidate = collector.video({'name': term, 'words': [term]}, vid)
+            if candidate and candidate.get('published_at') and term.casefold() in candidate.get('title', '').casefold():
+                row = candidate
+                break
+        if not row:
+            raise ValueError('没有取得可核验的搜索样本')
+        row['brands'] = [term]
+        with tempfile.TemporaryDirectory() as folder:
+            paths = export_bundle([row], Path(folder), Path(folder) / 'missing.xlsx', [{'name': term}], [int(row['published_at'][:4])])
+            book = load_workbook(paths[0])
+            try:
+                assert book.active['A1'].value == '品牌' and book.active.max_column == 12
+            finally:
+                book.close()
+            assert len(paths) == 3
+        result = {'ok': True, 'search_results': len(found), 'date_obtained': True,
+                  'description_obtained': bool(row.get('description')), 'export_files': 3}
+    except Exception as exc:
+        result['error'] = str(exc)[:300]
+    Path(report_path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+    return result['ok']
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == '--check-package':
+        sys.exit(0 if check_package(sys.argv[2], sys.argv[3]) else 1)
+    if len(sys.argv) == 4 and sys.argv[1] == '--check-one-click':
+        from portable_check import check_one_click
+        sys.exit(0 if check_one_click(sys.modules[__name__], sys.argv[2], sys.argv[3]) else 1)
     main()

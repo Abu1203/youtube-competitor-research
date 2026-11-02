@@ -1,6 +1,6 @@
 """Durable discovery and fair, restartable metadata processing (no network at import)."""
 import json
-from collections import deque
+from collections import deque, Counter
 from itertools import zip_longest
 
 
@@ -11,7 +11,7 @@ LABELS = {"running": "采集中", "complete": "采集完成", "partial": "部分
 
 def blocked(exc):
     return any(word in str(exc).lower() for word in
-               ("429", "not a bot", "too many requests", "验证访问", "unusual traffic"))
+               ("429", "not a bot", "too many requests", "验证访问", "unusual traffic", "captcha"))
 
 
 class TaskStore:
@@ -85,12 +85,14 @@ class TaskStore:
             db.execute("UPDATE discovery_items SET state=?,error=?,attempts=attempts+? WHERE run_id=? AND brand=? AND video_id=?",
                        (state, error[:500], int(attempted), run, brand, video_id))
 
-    def pending(self, run, brands):
+    def pending(self, run, brands, include_retry=True):
         queues = []
         with self.ledger.connect() as db:
             for brand in brands:
-                rows = db.execute("""SELECT video_id FROM discovery_items WHERE run_id=? AND brand=?
-                    AND state IN ('pending','error','missing_date') ORDER BY attempts,rowid""", (run, brand["name"])).fetchall()
+                states = ('pending', 'error', 'missing_date') if include_retry else ('pending',)
+                placeholders = ','.join('?' for _ in states)
+                rows = db.execute(f"""SELECT video_id FROM discovery_items WHERE run_id=? AND brand=?
+                    AND state IN ({placeholders}) ORDER BY attempts,rowid""", (run, brand["name"], *states)).fetchall()
                 queues.append(deque((brand, row[0]) for row in rows))
         while any(queues):
             # Prefer brands with the least attempts across resumptions as well.
@@ -108,7 +110,7 @@ class TaskStore:
         return {"unique": unique, "items": items, "jobs": jobs}
 
 
-def collect_web(ledger, collector, brands, years, depth, limit, run, publish, log, refresh=False, channel_scan=False):
+def collect_web(ledger, collector, brands, years, depth, limit, run, publish, log, refresh=False, channel_scan=False, deep=False, strict_title=False, retry_issues=True):
     store = TaskStore(ledger)
     store.status(run, "running")
     state = "complete"
@@ -128,13 +130,26 @@ def collect_web(ledger, collector, brands, years, depth, limit, run, publish, lo
                 log(f"{brand['name']} 官方频道解析失败，保留任务：{exc}")
         plans = []
         history = ledger.rows()
+        selected_names = {brand['name'] for brand in brands}
+        official_ids = {cid for cid in official.values() if cid}
+        channel_counts = Counter(row.get('channel_id') for row in history if row.get('channel_id')
+                                 and row.get('channel_id') not in official_ids
+                                 and selected_names.intersection(row.get('brands') or [row.get('brand')]))
+        # Focus on channels that repeatedly appeared, as in the validated large run.
+        selected_channels = {cid for cid, count in channel_counts.most_common(50) if count >= 2} if deep else None
         for brand in brands:
             if channel_scan:
                 queries = list(dict.fromkeys(row['channel_id'] for row in history
-                    if row.get('channel_id') and brand['name'] in row.get('brands', [row.get('brand')])))
+                    if row.get('channel_id') and (selected_channels is None or row['channel_id'] in selected_channels)
+                    and brand['name'] in row.get('brands', [row.get('brand')])))
             else:
                 words = list(dict.fromkeys(brand['words']))
                 queries = list(dict.fromkeys(words + [f"{word} {year}" for word in words for year in years]))
+                if deep:
+                    queries += [f"{word} after:{year-1}-12-31 before:{year}-07-01"
+                                for word in words for year in years]
+                    queries += [f"{word} after:{year}-06-30 before:{year+1}-01-01"
+                                for word in words for year in years]
             plans.append([(brand, query) for query in queries])
         # Discovery is persisted before any expensive metadata work.
         for group in zip_longest(*plans):
@@ -144,12 +159,16 @@ def collect_web(ledger, collector, brands, years, depth, limit, run, publish, lo
                 brand, query = task
                 name = brand['name']
                 collector.check_stop()
-                if store.seed(run, name, query) == 'complete':
+                job_state = store.seed(run, name, query)
+                if job_state == 'complete' or job_state == 'error' and not retry_issues:
                     continue
                 count = 0
                 try:
                     log(f"发现线索：{name} · {query}")
-                    entries = collector.channel_videos(query, depth) if channel_scan else collector.search(query, depth)
+                    if channel_scan:
+                        entries = collector.channel_videos_deep(query, depth, brand if strict_title else None) if deep else collector.channel_videos(query, depth)
+                    else:
+                        entries = collector.search_deep(query, depth) if deep else collector.search(query, depth)
                     for video_id in store.discover_entries(run, name, entries, collector.check_stop):
                         count += 1
                     store.job(run, name, query, 'complete', count)
@@ -160,7 +179,7 @@ def collect_web(ledger, collector, brands, years, depth, limit, run, publish, lo
                         raise
                     log(f"查询失败，继续其他任务：{name} · {exc}")
         log(f"发现阶段结束：{store.counts(run)['unique']} 个不同视频；开始轮流补齐各品牌详情。")
-        for brand, video_id in store.pending(run, brands):
+        for brand, video_id in store.pending(run, brands, retry_issues):
             collector.check_stop()
             name = brand['name']
             if name in unavailable:
@@ -183,13 +202,15 @@ def collect_web(ledger, collector, brands, years, depth, limit, run, publish, lo
                         raise ValueError('视频详情为空')
                     fetched_rows[video_id] = row
                     ledger.store_cache(row)
-                if official.get(name) and row.get('channel_id') == official[name]:
+                if row.get('channel_id') and row.get('channel_id') in {cid for cid in official.values() if cid}:
                     outcome = 'official'
                 elif not row.get('published_at'):
                     outcome = 'missing_date'
                 elif row['published_at'][:4] not in {str(y) for y in years}:
                     outcome = 'year'
-                elif not any(w.casefold() in ((row.get('title') or '') + ' ' + (row.get('description') or '')).casefold() for w in brand['words']):
+                elif strict_title and brand['name'].casefold() not in (row.get('title') or '').casefold():
+                    outcome = 'unrelated'
+                elif not strict_title and not any(w.casefold() in ((row.get('title') or '') + ' ' + (row.get('description') or '')).casefold() for w in brand['words']):
                     outcome = 'unrelated'
                 else:
                     publish(dict(row, brand=name), run)

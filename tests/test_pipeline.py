@@ -112,6 +112,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_official_rejection_does_not_starve_next_brand(self):
         brands = [dict(BRANDS[0], official='UCcreator'), BRANDS[1]]
+        self.collector.rows['Beta1'] = dict(row('Beta1'), channel_id='UCother')
         self.collect(1, brands)
         self.collect(1, brands)
         self.assertEqual(self.collector.reads, ['Alpha1', 'Beta1'])
