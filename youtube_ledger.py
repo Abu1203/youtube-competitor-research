@@ -468,7 +468,8 @@ def export_grouped(rows, output_path, template_path):
             cell.data_type = 's'
         # openpyxl moves cells but does not update hyperlinks' stored references.
         for index, (_, entry) in enumerate(expanded, 2):
-            for cell in sheet[index]:
+            for column in range(1, 13):
+                cell = sheet.cell(index, column)
                 if cell.hyperlink:
                     cell.hyperlink = None
             for column, field in ((3, 'video_url'), (9, 'channel_url')):
