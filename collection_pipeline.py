@@ -65,6 +65,21 @@ class TaskStore:
             db.execute("INSERT OR IGNORE INTO discovery_items(run_id,brand,video_id) VALUES (?,?,?)",
                        (run, brand, video_id))
 
+    def discover_entries(self, run, brand, entries, check_stop):
+        # Keep one connection alive during pagination. Each new ID is still committed
+        # immediately; duplicates do not repeatedly open/close SQLite's WAL files.
+        with self.ledger.connect() as db:
+            known = {r[0] for r in db.execute(
+                "SELECT video_id FROM discovery_items WHERE run_id=? AND brand=?", (run, brand))}
+            for video_id in entries:
+                check_stop()
+                if video_id not in known:
+                    db.execute("INSERT OR IGNORE INTO discovery_items(run_id,brand,video_id) VALUES (?,?,?)",
+                               (run, brand, video_id))
+                    db.commit()
+                    known.add(video_id)
+                yield video_id
+
     def item(self, run, brand, video_id, state, error="", attempted=False):
         with self.ledger.connect() as db:
             db.execute("UPDATE discovery_items SET state=?,error=?,attempts=attempts+? WHERE run_id=? AND brand=? AND video_id=?",
@@ -135,9 +150,7 @@ def collect_web(ledger, collector, brands, years, depth, limit, run, publish, lo
                 try:
                     log(f"发现线索：{name} · {query}")
                     entries = collector.channel_videos(query, depth) if channel_scan else collector.search(query, depth)
-                    for video_id in entries:
-                        collector.check_stop()
-                        store.discover(run, name, video_id)
+                    for video_id in store.discover_entries(run, name, entries, collector.check_stop):
                         count += 1
                     store.job(run, name, query, 'complete', count)
                     log(f"已保存线索：{name} · {query} · {count} 条（每种排序/频道分页上限 {depth}）")
