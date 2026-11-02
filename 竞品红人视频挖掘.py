@@ -30,7 +30,7 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 if (APP_DIR / "lib").is_dir():
     sys.path.insert(0, str(APP_DIR / "lib"))
-from youtube_ledger import Ledger, channel_details, page_metrics, export_reference, table_values, local_stamp, HEADERS, country_code
+from youtube_ledger import Ledger, channel_details, page_metrics, export_grouped, table_values, local_stamp, HEADERS, country_code
 from ytscrape_metrics import interaction_metrics
 from collection_pipeline import TaskStore, collect_web, LABELS, blocked
 STATE_PATH = APP_DIR / "竞品红人挖掘_工作数据.json"
@@ -523,7 +523,7 @@ TEMPLATE_PATH = APP_DIR / "竞品youtube视频数据.xlsx"
 
 
 def export_excel(rows, path):
-    export_reference(rows, path, TEMPLATE_PATH)
+    export_grouped(rows, path, TEMPLATE_PATH)
 
 
 class App:

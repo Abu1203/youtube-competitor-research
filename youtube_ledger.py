@@ -427,3 +427,58 @@ def export_reference(rows, output_path, template_path):
     book.save(output_path)
     template.close()
     book.close()
+
+
+def export_grouped(rows, output_path, template_path):
+    """Export one row per brand/video with the brand first and stable grouping."""
+    import tempfile
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+    order = ('Mammotion', 'Yarbo', 'Lymow', 'Mowrator')
+    expanded, seen = [], set()
+    for row in rows:
+        names = row.get('brands') or ([row['brand']] if row.get('brand') else [])
+        for brand in dict.fromkeys(names):
+            if not brand or (brand.casefold(), row['video_id']) in seen:
+                continue
+            seen.add((brand.casefold(), row['video_id']))
+            entry = copy.deepcopy(row)
+            entry['video_id'] = brand + '::' + row['video_id']
+            expanded.append((brand, entry))
+    def group_key(item):
+        name = item[0]
+        index = next((i for i, value in enumerate(order) if value.casefold() == name.casefold()), len(order))
+        return (index, name.casefold())
+    expanded.sort(key=group_key)
+    target = Path(output_path)
+    with tempfile.TemporaryDirectory(dir=target.parent) as folder:
+        temporary = Path(folder) / 'grouped.xlsx'
+        export_reference([row for _, row in expanded], temporary, template_path)
+        book = load_workbook(temporary)
+        sheet = book.active
+        widths = [sheet.column_dimensions[get_column_letter(i)].width for i in range(1, 12)]
+        sheet.insert_cols(1)
+        for index, brand in enumerate(['品牌'] + [name for name, _ in expanded], 1):
+            cell = sheet.cell(index, 1, brand)
+            source = sheet.cell(index, 2)
+            cell.font = copy.copy(source.font)
+            cell.fill = copy.copy(source.fill)
+            cell.border = copy.copy(source.border)
+            cell.alignment = copy.copy(source.alignment)
+            cell.data_type = 's'
+        # openpyxl moves cells but does not update hyperlinks' stored references.
+        for index, (_, entry) in enumerate(expanded, 2):
+            for cell in sheet[index]:
+                if cell.hyperlink:
+                    cell.hyperlink = None
+            for column, field in ((3, 'video_url'), (9, 'channel_url')):
+                if entry.get(field):
+                    sheet.cell(index, column).hyperlink = entry[field]
+        sheet.column_dimensions['A'].width = 20
+        for index, width in enumerate(widths, 2):
+            sheet.column_dimensions[get_column_letter(index)].width = width
+        sheet.freeze_panes = 'B2'
+        sheet.auto_filter.ref = sheet.dimensions
+        book.save(temporary)
+        book.close()
+        temporary.replace(target)

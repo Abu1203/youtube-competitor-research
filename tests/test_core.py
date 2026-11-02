@@ -10,7 +10,7 @@ from unittest.mock import patch
 import urllib.error
 
 from openpyxl import Workbook, load_workbook
-from youtube_ledger import HEADERS, Ledger, export_reference
+from youtube_ledger import HEADERS, Ledger, export_reference, export_grouped
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("research_app", ROOT / "竞品红人视频挖掘.py")
@@ -96,6 +96,23 @@ class LedgerTests(unittest.TestCase):
         book.close()
         with self.assertRaisesRegex(ValueError, "11 列"):
             export_reference([sample()], self.root / "output.xlsx", template)
+
+    def test_grouped_export_repeats_shared_videos_and_keeps_links(self):
+        row = sample()
+        row['brands'] = ['Yarbo', 'Mammotion']
+        row['title'] = '=1+1'
+        output = self.root / 'grouped.xlsx'
+        export_grouped([row, copy.deepcopy(row)], output, self.root / 'missing.xlsx')
+        book = load_workbook(output)
+        self.addCleanup(book.close)
+        sheet = book.active
+        self.assertEqual([cell.value for cell in sheet[1]], ['品牌'] + HEADERS)
+        self.assertEqual([sheet['A2'].value, sheet['A3'].value], ['Mammotion', 'Yarbo'])
+        self.assertEqual(sheet.max_row, 3)
+        self.assertEqual(sheet['B2'].data_type, 's')
+        self.assertEqual(sheet['C2'].hyperlink.target, row['video_url'])
+        self.assertEqual(sheet['I2'].hyperlink.target, row['channel_url'])
+        self.assertTrue(sheet['D2'].is_date)
 
 
 class ApiTests(unittest.TestCase):
