@@ -180,4 +180,3 @@ class OneClickTests(unittest.TestCase):
             self.assertEqual(state, 'partial')
             self.assertEqual(sorted(calls), ['one', 'two'])
             self.assertTrue((Path(summary['export_directory']) / '采集结果说明.txt').exists())
-
