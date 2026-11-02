@@ -2,7 +2,9 @@ import queue
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from collection_pipeline import TaskStore, collect_web
@@ -233,6 +235,19 @@ class ApiPipelineTests(unittest.TestCase):
 
 
 class SearchRoutingTests(unittest.TestCase):
+    def test_metadata_backend_provides_date_and_full_description_without_watch_page(self):
+        collector = app.WebCollector(threading.Event(), lambda _: None)
+        collector.metadata_client = SimpleNamespace(video=lambda _: SimpleNamespace(
+            published_at=datetime(2025, 6, 1, tzinfo=timezone.utc), uploaded_at=None,
+            title='Example review', description='Example full description', channel_id='UCexample',
+            channel='Example creator', views=23))
+        with patch.object(collector, 'extract', side_effect=AssertionError('watch page should not be used')):
+            row = collector.video({'name': 'Example', 'words': ['Example']}, 'sample-id')
+        self.assertEqual(row['published_at'][:10], '2025-06-01')
+        self.assertEqual(row['description'], 'Example full description')
+        self.assertEqual(row['views'], 23)
+        self.assertIsNone(row['likes'])
+
     def test_access_block_warning_stops_incomplete_metadata_processing(self):
         collector = app.WebCollector(threading.Event(), lambda _: None)
         for warning in ('HTTP Error 429: Too Many Requests', "Sign in to confirm you're not a bot"):

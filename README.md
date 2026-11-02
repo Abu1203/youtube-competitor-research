@@ -1,6 +1,6 @@
 # YouTube 竞品视频挖掘
 
-基于 Python / Tkinter 的桌面工具，按品牌搜索 YouTube 公开视频，维护本地历史台账，并导出 Excel。默认通过 yt-dlp 读取公开元数据，也可选择 YouTube Data API。
+基于 Python / Tkinter 的桌面工具，按品牌搜索 YouTube 公开视频，维护本地历史台账，并导出 Excel。网页模式用 yt-dlp 搜索、优先使用 ytscrape 获取详情，也可选择 YouTube Data API。
 
 ## 功能
 
@@ -83,6 +83,7 @@ python scripts/check_publication.py
 本项目代码采用 [MIT License](LICENSE)。依赖独立安装并遵循各自许可证：
 
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)：公开元数据提取。
+- [ytscrape](https://github.com/vsmutok/ytscrape)：公开视频详情、发布日期和描述；获取失败时尝试原有 yt-dlp 路径。
 - [openpyxl](https://openpyxl.readthedocs.io/)：Excel 读写。
 - [pycountry](https://github.com/pycountry/pycountry)：国家代码转换。
 

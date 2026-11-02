@@ -363,6 +363,36 @@ class WebCollector:
             raise RuntimeError("部分排序未完成：" + "; ".join(failures))
 
     def video(self, brand: dict, video_id: str) -> dict | None:
+        # ytscrape retrieves public metadata without downloading media. Its
+        # InnerTube client can succeed when the yt-dlp watch-page path is blocked.
+        self.check_stop()
+        try:
+            from ytscrape import YouTube
+            if not hasattr(self, 'metadata_client'):
+                self.metadata_client = YouTube()
+            info = self.metadata_client.video(video_id)
+            published = info.published_at or info.uploaded_at
+            if info.title and published:
+                title, description = info.title, info.description or ''
+                channel_id = info.channel_id or ''
+                return {
+                    'key': brand['name'] + '::' + video_id, 'brand': brand['name'],
+                    'video_id': video_id, 'title': title, 'description': description,
+                    'video_url': 'https://www.youtube.com/watch?v=' + video_id,
+                    'published_at': published.isoformat(), 'views': safe_int(info.views),
+                    'likes': None, 'comments': None, 'channel_id': channel_id,
+                    'channel_name': info.channel or '',
+                    'channel_url': 'https://www.youtube.com/channel/' + channel_id if channel_id else '',
+                    'subscribers': None, 'region': '', 'video_type': infer_type(title),
+                    'evidence': evidence_for(title, description, brand['words'], None),
+                    'collected_at': utc_now(), 'source': '网页 / ytscrape',
+                }
+        except ImportError:
+            pass  # Older installations can still use the existing yt-dlp backend.
+        except Exception as exc:
+            if isinstance(exc, InterruptedError) or blocked(exc):
+                raise
+            self.log(f'ytscrape 暂未取得详情，尝试 yt-dlp：{video_id} · {str(exc)[:120]}')
         data = self.extract("https://www.youtube.com/watch?v=" + video_id)
         if not data:
             return None

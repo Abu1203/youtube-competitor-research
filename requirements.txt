@@ -1,3 +1,4 @@
 yt-dlp>=2026.8.19
+ytscrape>=2.2.0,<3
 openpyxl>=3.1
 pycountry>=24.6.1
