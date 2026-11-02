@@ -233,6 +233,12 @@ class ApiPipelineTests(unittest.TestCase):
 
 
 class SearchRoutingTests(unittest.TestCase):
+    def test_access_block_warning_stops_incomplete_metadata_processing(self):
+        collector = app.WebCollector(threading.Event(), lambda _: None)
+        for warning in ('HTTP Error 429: Too Many Requests', "Sign in to confirm you're not a bot"):
+            with self.assertRaisesRegex(RuntimeError, '访问受限'):
+                collector.warning(warning)
+
     def test_both_sort_orders_use_supported_extractors_and_deduplicate(self):
         from yt_dlp.extractor.youtube import YoutubeSearchIE, YoutubeSearchURLIE
         collector = app.WebCollector(threading.Event(), lambda _: None)

@@ -301,6 +301,10 @@ class WebCollector:
         pass
 
     def warning(self, message):
+        # yt-dlp may downgrade access blocks to warnings with metadata-only extraction.
+        # Do not accept incomplete rows or keep sending requests in that case.
+        if blocked(message):
+            raise RuntimeError("YouTube 访问受限，请稍后继续。" + message)
         # 格式/JavaScript 警告与本工具不下载视频的用途无关；关键错误仍呈现。
         if not any(word in message for word in ("JavaScript runtime", "formats may", "formats have")):
             self.log("网页提取提示：" + message)
@@ -486,12 +490,13 @@ class App:
         self.worker = None
         self.current_run = self.ledger.setting("last_run")
         self.brand_rows = []
-        self.collect_mode = StringVar(value="网页采集（免 Key）")
+        saved_ui = self.ledger.setting("collection_config", {})
+        self.collect_mode = StringVar(value=saved_ui.get("mode", "网页采集（免 Key）"))
         self.api_key = StringVar()
-        self.search_limit = StringVar(value="300")
-        self.batch_limit = StringVar(value="500")
-        self.refresh_existing = BooleanVar(value=False)
-        self.year_vars = {year: BooleanVar(value=True) for year in YEARS}
+        self.search_limit = StringVar(value=str(saved_ui.get("depth", 300)))
+        self.batch_limit = StringVar(value=str(saved_ui.get("limit", 500)))
+        self.refresh_existing = BooleanVar(value=saved_ui.get("refresh", False))
+        self.year_vars = {year: BooleanVar(value=year in saved_ui.get("years", YEARS)) for year in YEARS}
         self.history_brand = StringVar(value="全部品牌")
         self.history_year = StringVar(value="全部年份")
         self.history_batch = StringVar(value="全部历史")
@@ -504,6 +509,7 @@ class App:
         self.history_rows = []
         self.run_map = {}
         self.build_ui()
+        self.mode_changed(reset=False)
         self.refresh_tables()
         self.root.after(120, self.process_events)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -681,12 +687,13 @@ class App:
         table.bind("<Double-1>", lambda _e: self.open_video())
         return table
 
-    def mode_changed(self, _event=None):
+    def mode_changed(self, _event=None, reset=True):
         web = self.collect_mode.get().startswith("网页")
         self.depth_label.configure(text="每词/排序线索上限" if web else "搜索页数/季度")
         self.limit_label.configure(text="本次详情请求上限" if web else "当次搜索调用上限")
-        self.search_limit.set("300" if web else "2")
-        self.batch_limit.set("500" if web else "80")
+        if reset:
+            self.search_limit.set("300" if web else "2")
+            self.batch_limit.set("500" if web else "80")
         if web:
             self.key_frame.pack_forget()
         else:
@@ -859,6 +866,7 @@ class App:
         config = {"brands": brands, "years": years, "mode": self.collect_mode.get(),
                   "depth": depth, "limit": limit, "refresh": self.refresh_existing.get(),
                   "channel_scan": channel_scan, "pipeline": 2}
+        self.ledger.set_setting("collection_config", config)
         self.begin_run(config, "频道补扫" if channel_scan else "关键词采集")
         args = (brands, years, depth, limit, self.current_run, self.refresh_existing.get(), channel_scan)
         target = self.run_web if web else self.run_api
